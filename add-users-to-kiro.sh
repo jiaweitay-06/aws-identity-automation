@@ -1,200 +1,194 @@
 
 #!/usr/bin/env bash
+
 set -uo pipefail
 
-# Configuration: set these environment variables in CloudShell
-: "${AWS_REGION:=ap-southeast-5}"
-: "${IDENTITY_STORE_ID:?Set IDENTITY_STORE_ID first}"
-: "${GROUP_NAME:=kiro-users}"
+# ============================================================
+# Configuration
+# ============================================================
+AWS_REGION="${AWS_REGION:-ap-southeast-5}"
+IDENTITY_STORE_ID="${IDENTITY_STORE_ID:-}"
+GROUP_NAME="kiro-users"
+INPUT_CSV="${1:-users.csv}"
+RESULTS_CSV="results.csv"
 
-CSV="./users.csv"
-RESULTS="./results.csv"
+# ============================================================
+# Validate configuration and input
+# ============================================================
+if [[ -z "$IDENTITY_STORE_ID" ]]; then
+    echo "ERROR: IDENTITY_STORE_ID is not set."
+    echo 'Run: export IDENTITY_STORE_ID="d-your-actual-id"'
+    exit 1
+fi
 
-command -v aws >/dev/null || {
-  echo "ERROR: AWS CLI is required."
-  exit 1
-}
+if [[ ! -f "$INPUT_CSV" ]]; then
+    echo "ERROR: Input CSV not found: $INPUT_CSV"
+    exit 1
+fi
 
-command -v python3 >/dev/null || {
-  echo "ERROR: Python 3 is required."
-  exit 1
-}
+if ! command -v aws >/dev/null 2>&1; then
+    echo "ERROR: AWS CLI is not installed."
+    exit 1
+fi
 
-[[ -f "$CSV" ]] || {
-  echo "ERROR: $CSV not found."
-  exit 1
-}
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: Python 3 is required to read the CSV."
+    exit 1
+fi
 
-# Find the target group
-GROUP_LOOKUP=$(python3 -c \
-  'import json,sys; print(json.dumps({"UniqueAttribute":{"AttributePath":"displayName","AttributeValue":sys.argv[1]}}))' \
-  "$GROUP_NAME")
+if ! aws sts get-caller-identity \
+    --region "$AWS_REGION" >/dev/null 2>&1; then
+    echo "ERROR: AWS credentials are invalid or unavailable."
+    echo "Check your CloudShell session and AWS region."
+    exit 1
+fi
 
-GROUP_JSON=$(aws identitystore get-group-id \
-  --identity-store-id "$IDENTITY_STORE_ID" \
-  --alternate-identifier "$GROUP_LOOKUP" \
-  --region "$AWS_REGION" --output json) || exit 1
+echo "Region: $AWS_REGION"
+echo "Identity Store: $IDENTITY_STORE_ID"
+echo "Target group: $GROUP_NAME"
+echo "Input: $INPUT_CSV"
+echo
 
-GROUP_ID=$(python3 -c \
-  'import json,sys; print(json.load(sys.stdin)["GroupId"])' \
-  <<< "$GROUP_JSON")
+# ============================================================
+# Get the existing group ID
+# ============================================================
+echo "Looking up group: $GROUP_NAME"
 
-echo "Target group: $GROUP_NAME ($GROUP_ID)"
-
-printf 'Email,UserId,Result\n' > "$RESULTS"
-
-# Read the CSV. Keep the header: Email,FirstName,LastName
-while IFS=, read -r EMAIL FIRST LAST || [[ -n "${EMAIL:-}" ]]; do
-  [[ "${EMAIL:-}" == "Email" || -z "${EMAIL:-}" ]] && continue
-
-  EMAIL=$(echo "$EMAIL" | xargs)
-  FIRST=$(echo "${FIRST:-}" | xargs)
-  LAST=$(echo "${LAST:-}" | xargs)
-
-  echo ""
-  echo "Processing $EMAIL"
-
-  # Look up existing user by email
-  LOOKUP=$(python3 -c \
-    'import json,sys; print(json.dumps({"UniqueAttribute":{"AttributePath":"emails.value","AttributeValue":sys.argv[1]}}))' \
-    "$EMAIL")
-
-  USER_JSON=$(aws identitystore get-user-id \
+GROUP_LOOKUP=$(aws identitystore get-group-id \
     --identity-store-id "$IDENTITY_STORE_ID" \
-    --alternate-identifier "$LOOKUP" \
-    --region "$AWS_REGION" --output json 2>/dev/null)
-  LOOKUP_STATUS=$?
+    --alternate-identifier \
+    "{\"UniqueAttribute\":{\"AttributePath\":\"displayName\",\"AttributeValue\":\"$GROUP_NAME\"}}" \
+    --region "$AWS_REGION" \
+    --query 'GroupId' \
+    --output text 2>&1)
+GROUP_STATUS=$?
 
-  if [[ $LOOKUP_STATUS -eq 0 ]]; then
-    USER_ID=$(python3 -c \
-      'import json,sys; print(json.load(sys.stdin)["UserId"])' \
-      <<< "$USER_JSON")
-    echo "User already exists."
-  else
-    # Don't treat permission/network errors as missing users.
-    # Confirm the user is absent through a filtered list query.
-    FILTER=$(python3 -c \
-      'import json,sys; print(json.dumps([{"AttributePath":"Emails.Value","AttributeValue":sys.argv[1]}]))' \
-      "$EMAIL")
+if [[ $GROUP_STATUS -ne 0 || -z "$GROUP_LOOKUP" || "$GROUP_LOOKUP" == "None" ]]; then
+    echo "ERROR: Could not find group '$GROUP_NAME'."
+    echo "$GROUP_LOOKUP"
+    exit 1
+fi
 
-    SEARCH=$(aws identitystore list-users \
-      --identity-store-id "$IDENTITY_STORE_ID" \
-      --filters "$FILTER" \
-      --region "$AWS_REGION" --output json 2>&1) || {
-        echo "ERROR: Could not verify whether user exists: $SEARCH"
-        printf '"%s",,"Lookup failed"\n' "$EMAIL" >> "$RESULTS"
+GROUP_ID="$GROUP_LOOKUP"
+echo "Group ID: $GROUP_ID"
+echo
+
+# ============================================================
+# Prepare results CSV
+# ============================================================
+printf '"Email","UserId","Result"\n' > "$RESULTS_CSV"
+
+# ============================================================
+# Process each user from the input CSV
+# Uses Python's CSV reader to handle quoted CSV fields.
+# ============================================================
+while IFS=$'\t' read -r email first_name last_name; do
+
+    # Skip empty rows
+    [[ -z "$email" ]] && continue
+
+    echo "Processing $email"
+
+    # --------------------------------------------------------
+    # Create the user directly; no existence lookup is done.
+    # --------------------------------------------------------
+    CREATE_OUTPUT=$(aws identitystore create-user \
+        --identity-store-id "$IDENTITY_STORE_ID" \
+        --user-name "$email" \
+        --display-name "$first_name $last_name" \
+        --name "GivenName=$first_name,FamilyName=$last_name" \
+        --emails "Value=$email,Type=Work,Primary=true" \
+        --region "$AWS_REGION" \
+        --query 'UserId' \
+        --output text 2>&1)
+    CREATE_STATUS=$?
+
+    if [[ $CREATE_STATUS -ne 0 || -z "$CREATE_OUTPUT" || "$CREATE_OUTPUT" == "None" ]]; then
+        echo "ERROR: Could not create $email"
+        echo "$CREATE_OUTPUT"
+
+        printf '"%s","","%s"\n' \
+            "$email" "Create failed" >> "$RESULTS_CSV"
+
+        echo
         continue
-      }
-
-    COUNT=$(python3 -c \
-      'import json,sys; print(len(json.load(sys.stdin).get("Users",[])))' \
-      <<< "$SEARCH")
-
-    if [[ "$COUNT" -gt 0 ]]; then
-      echo "ERROR: User lookup was unsuccessful but matching email exists."
-      printf '"%s",,"Lookup ambiguous"\n' "$EMAIL" >> "$RESULTS"
-      continue
     fi
 
-    if [[ -z "$FIRST" || -z "$LAST" ]]; then
-      echo "ERROR: FirstName and LastName are required for a new user."
-      printf '"%s",,"Missing name"\n' "$EMAIL" >> "$RESULTS"
-      continue
-    fi
-
-    echo "Creating user..."
-
-    NAME_JSON=$(python3 -c \
-      'import json,sys; print(json.dumps({"GivenName":sys.argv[1],"FamilyName":sys.argv[2]}))' \
-      "$FIRST" "$LAST")
-
-    EMAIL_JSON=$(python3 -c \
-      'import json,sys; print(json.dumps([{"Value":sys.argv[1],"Type":"Work","Primary":True}]))' \
-      "$EMAIL")
-
-    CREATED=$(aws identitystore create-user \
-      --identity-store-id "$IDENTITY_STORE_ID" \
-      --user-name "$EMAIL" \
-      --display-name "$FIRST $LAST" \
-      --name "$NAME_JSON" \
-      --emails "$EMAIL_JSON" \
-      --region "$AWS_REGION" --output json 2>&1) || {
-        echo "ERROR creating user: $CREATED"
-        printf '"%s",,"Create failed"\n' "$EMAIL" >> "$RESULTS"
-        continue
-      }
-
-    USER_ID=$(python3 -c \
-      'import json,sys; print(json.load(sys.stdin)["UserId"])' \
-      <<< "$CREATED")
-
+    USER_ID="$CREATE_OUTPUT"
     echo "Created user: $USER_ID"
-  fi
 
-  # Check ALL pages of group membership
-  NEXT_TOKEN=""
-  IS_MEMBER=false
-  MEMBERSHIP_ERROR=false
+    # --------------------------------------------------------
+    # Add the newly created user to kiro-users.
+    # --------------------------------------------------------
+    MEMBERSHIP_OUTPUT=$(aws identitystore create-group-membership \
+        --identity-store-id "$IDENTITY_STORE_ID" \
+        --group-id "$GROUP_ID" \
+        --member-id "UserId=$USER_ID" \
+        --region "$AWS_REGION" 2>&1)
+    MEMBERSHIP_STATUS=$?
 
-  while :; do
-    ARGS=(
-      identitystore list-group-memberships
-      --identity-store-id "$IDENTITY_STORE_ID"
-      --group-id "$GROUP_ID"
-      --region "$AWS_REGION"
-      --output json
-    )
+    if [[ $MEMBERSHIP_STATUS -eq 0 ]]; then
+        echo "SUCCESS: Created and added $email to $GROUP_NAME"
 
-    [[ -n "$NEXT_TOKEN" ]] && ARGS+=(--next-token "$NEXT_TOKEN")
+        printf '"%s","%s","%s"\n' \
+            "$email" "$USER_ID" "Created and added" >> "$RESULTS_CSV"
+    else
+        echo "ERROR: User created, but group membership failed."
+        echo "$MEMBERSHIP_OUTPUT"
 
-    PAGE=$(aws "${ARGS[@]}" 2>&1) || {
-      echo "ERROR checking membership: $PAGE"
-      MEMBERSHIP_ERROR=true
-      break
-    }
+        printf '"%s","%s","%s"\n' \
+            "$email" "$USER_ID" "Created; group add failed" >> "$RESULTS_CSV"
+    fi
 
-    FOUND=$(python3 -c \
-      'import json,sys; d=json.load(sys.stdin); uid=sys.argv[1]; print(any(m.get("MemberId",{}).get("UserId")==uid for m in d.get("Memberships",[])))' \
-      "$USER_ID" <<< "$PAGE")
+    echo
 
-    [[ "$FOUND" == "True" ]] && IS_MEMBER=true
+done < <(python3 - "$INPUT_CSV" <<'PY'
+import csv
+import sys
 
-    NEXT_TOKEN=$(python3 -c \
-      'import json,sys; print(json.load(sys.stdin).get("NextToken",""))' \
-      <<< "$PAGE")
+path = sys.argv[1]
 
-    [[ -z "$NEXT_TOKEN" || "$IS_MEMBER" == true ]] && break
-  done
+with open(path, "r", encoding="utf-8-sig", newline="") as f:
+    reader = csv.DictReader(f)
 
-  if [[ "$MEMBERSHIP_ERROR" == true ]]; then
-    printf '"%s","%s","Membership check failed"\n' "$EMAIL" "$USER_ID" >> "$RESULTS"
-    continue
-  fi
+    required = {"Email", "FirstName", "LastName"}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        print(
+            "ERROR: CSV headers must be Email,FirstName,LastName",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-  if [[ "$IS_MEMBER" == true ]]; then
-    echo "Already in $GROUP_NAME; skipping."
-    printf '"%s","%s","Already a member"\n' "$EMAIL" "$USER_ID" >> "$RESULTS"
-    continue
-  fi
+    for row in reader:
+        email = (row.get("Email") or "").strip()
+        first_name = (row.get("FirstName") or "").strip()
+        last_name = (row.get("LastName") or "").strip()
 
-  MEMBER_JSON=$(python3 -c \
-    'import json,sys; print(json.dumps({"UserId":sys.argv[1]}))' \
-    "$USER_ID")
+        if not email:
+            continue
 
-  if aws identitystore create-group-membership \
-    --identity-store-id "$IDENTITY_STORE_ID" \
-    --group-id "$GROUP_ID" \
-    --member-id "$MEMBER_JSON" \
-    --region "$AWS_REGION" >/dev/null; then
+        if not first_name or not last_name:
+            print(
+                f"WARNING: Skipping {email}: first or last name is missing.",
+                file=sys.stderr,
+            )
+            continue
 
-    echo "Added to $GROUP_NAME."
-    printf '"%s","%s","Added successfully"\n' "$EMAIL" "$USER_ID" >> "$RESULTS"
-  else
-    echo "ERROR adding user to group."
-    printf '"%s","%s","Membership creation failed"\n' "$EMAIL" "$USER_ID" >> "$RESULTS"
-  fi
-done < "$CSV"
+        # Tab-separated fields for the Bash loop.
+        # Names containing tabs are not supported by this simple interface.
+        fields = (email, first_name, last_name)
+        if any("\t" in value or "\n" in value for value in fields):
+            print(
+                f"WARNING: Skipping {email}: tab/newline in a field.",
+                file=sys.stderr,
+            )
+            continue
 
-echo ""
-echo "Finished. Results saved to $RESULTS"
-cat "$RESULTS"
+        print("\t".join(fields))
+PY
+)
+
+echo "Finished processing CSV."
+echo "Results saved to: $RESULTS_CSV"
+echo
+cat "$RESULTS_CSV"
