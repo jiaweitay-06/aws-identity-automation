@@ -35,3 +35,11 @@ export AWS_REGION="ap-southeast-1"
 chmod +x add-users.sh
 ./add-users.sh users.csv
 ```
+
+
+## Proper CSV format
+
+```bash
+Email,FirstName,LastName
+john@example.com,John,Doe
+```
